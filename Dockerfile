@@ -1,7 +1,7 @@
 FROM node:18-alpine
 
 # yt-dlp 설치
-RUN apk update && apk add --no-cache yt-dlp
+RUN apk update && apk add --no-cache yt-dlp ffmpeg
 
 # 앱 위치
 WORKDIR /app

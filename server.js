@@ -3,7 +3,6 @@ import cors from "@fastify/cors";
 import { spawn } from "child_process";
 
 const fastify = Fastify({ logger: true });
-await fastify.register(multipart);
 await fastify.register(cors, { origin: "*" });
 
 fastify.post("/api/download", async (request, reply) => {

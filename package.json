@@ -1,0 +1,14 @@
+{
+  "name": "lee-downloader-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.0",
+    "@fastify/multipart": "^8.0.0",
+    "fastify": "^4.0.0"
+  }
+}

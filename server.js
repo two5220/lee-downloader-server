@@ -1,5 +1,4 @@
 import Fastify from "fastify";
-import multipart from "@fastify/multipart";
 import cors from "@fastify/cors";
 import { spawn } from "child_process";
 

@@ -1,189 +1,161 @@
-// server.js  (CommonJS 버전)
+// server.js
+const fastify = require('fastify')({ logger: true });
+const cors = require('@fastify/cors');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
 
-const path = require("path");
-const fs = require("fs");
-const { spawn } = require("child_process");
-const fastify = require("fastify")({ logger: true });
-const cors = require("@fastify/cors");
-
-// ========= 기본 설정 =========
-const PORT = process.env.PORT || 10000;
-
-// CORS: GitHub Pages 와 프론트에서 호출 가능하도록 전체 허용
+// CORS: 아무 origin이나 허용 (GitHub Pages, 로컬 등)
 fastify.register(cors, {
-  origin: true,          // '*' 대신 true: Origin 그대로 반사
-  methods: ["GET", "POST", "OPTIONS"],
+  origin: true,
 });
 
-// 헬스체크
-fastify.get("/", async () => {
-  return { ok: true, service: "Lee Downloader API" };
+// 헬스체크용 (GET /)
+fastify.get('/', async () => {
+  return { ok: true, name: 'Lee Downloader API' };
 });
 
-// ========= /api/download =========
-// body: { url, mode, quality }
-//   mode: "video" | "audio"
-//   quality: "auto" | "2160p" | "1440p" | ...
-fastify.post("/api/download", async (request, reply) => {
-  const { url, mode = "video", quality = "auto" } = request.body || {};
+// 유틸: 임시 파일 경로 만들기
+function makeTempPath(mode) {
+  const ext = mode === 'audio' ? '.mp3' : '.mp4';
+  const name = 'lee_' + crypto.randomBytes(8).toString('hex') + ext;
+  return path.join(os.tmpdir(), name);
+}
 
-  if (!url || typeof url !== "string") {
-    reply.code(400);
-    return { success: false, message: "URL이 비어 있습니다." };
-  }
+// 포맷 매핑 (아주 단순 버전)
+function buildYtDlpArgs(body, tmpPath) {
+  const { url, mode, quality } = body;
+  const args = [
+    url,
+    '-o', tmpPath,
+    '--no-playlist',
+  ];
 
-  // 임시 파일 경로 만들기 (/tmp 는 리눅스 컨테이너에서 사용 가능)
-  const id = Date.now() + "-" + Math.random().toString(16).slice(2);
-  let ext = mode === "audio" ? "mp3" : "mp4";
-  const tmpPath = path.join("/tmp", `lee_downloader_${id}.${ext}`);
-
-  // yt-dlp 인자 만들기
-  const args = [];
-
-  // 출력 파일
-  args.push("-o", tmpPath);
-
-  // 재생목록 통째로 말고 단일만
-  args.push("--no-playlist");
-
-  // 모드에 따라 포맷 설정
-  if (mode === "audio") {
-    // 최고 음질 오디오 → mp3 변환
+  if (mode === 'audio') {
+    // 오디오만 (mp3 최고 품질)
     args.push(
-      "-f",
-      "bestaudio/best",
-      "--extract-audio",
-      "--audio-format",
-      "mp3",
-      "--audio-quality",
-      "0"
+      '-f', 'ba/b',
+      '-x',
+      '--audio-format', 'mp3',
+      '--audio-quality', '0',
     );
   } else {
-    // 영상 모드
-    // 기본 포맷: best video + best audio
-    let format = "bv*+ba/best";
-
-    // 해상도 제한 (quality 값은 "1080p" 이런 식)
-    const map = {
-      "2160p": 2160,
-      "1440p": 1440,
-      "1080p": 1080,
-      "720p": 720,
-      "480p": 480,
-      "360p": 360,
-    };
-
-    if (quality && quality !== "auto" && map[quality]) {
-      const h = map[quality];
-      format = `bestvideo[height<=${h}]+bestaudio/best`;
+    // 영상
+    let format = 'bv*+ba/b';
+    if (quality && quality !== 'auto') {
+      // quality는 "2160p", "1080p" 이런 식으로 온다고 가정
+      const num = parseInt(quality, 10);
+      if (!isNaN(num)) {
+        format = `bestvideo[height<=${num}]+bestaudio/best`;
+      }
     }
-
-    args.push("-f", format);
+    args.push('-f', format);
   }
 
-  // URL 마지막에 추가
-  args.push(url);
+  return args;
+}
 
-  fastify.log.info({ url, mode, quality, tmpPath }, "Start yt-dlp");
+// 실제 다운로드 API
+fastify.post('/api/download', async (request, reply) => {
+  const body = request.body || {};
+  const { url, mode = 'video', quality = 'auto' } = body;
 
-  return new Promise((resolve) => {
-    let stderr = "";
+  if (!url || typeof url !== 'string') {
+    return reply
+      .code(400)
+      .type('application/json')
+      .send({ success: false, message: 'URL이 비어 있습니다.' });
+  }
 
-    const ytdlp = spawn("yt-dlp", args);
+  const tmpPath = makeTempPath(mode);
 
-    ytdlp.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      console.log("yt-dlp:", text.trim());
-    });
+  const args = buildYtDlpArgs({ url, mode, quality }, tmpPath);
+  fastify.log.info({ url, mode, quality, tmpPath, args }, 'yt-dlp 시작');
 
-    ytdlp.on("error", (err) => {
-      fastify.log.error({ err }, "yt-dlp spawn error");
-      if (fs.existsSync(tmpPath)) {
-        fs.unlink(tmpPath, () => {});
-      }
-      reply.code(500);
-      resolve({
-        success: false,
-        message: "서버에서 yt-dlp 실행 중 오류가 발생했습니다.",
-      });
-    });
+  const ytdlp = spawn('yt-dlp', args);
 
-    ytdlp.on("close", (code) => {
-      fastify.log.info({ code }, "yt-dlp exit");
-
-      // 실패 처리
-      if (code !== 0 || !fs.existsSync(tmpPath)) {
-        let msg = "다운로드 중 오류가 발생했습니다.";
-
-        // 유튜브 “로그인/봇 확인” 에러 감지
-        if (stderr.includes("Sign in to confirm you're not a bot")) {
-          msg =
-            "이 영상은 유튜브 로그인이 필요해서 웹 버전에서는 다운로드할 수 없습니다.\n" +
-            "PC용 Lee Downloader 프로그램에서 시도해 주세요.";
-        } else if (stderr.toLowerCase().includes("copyright")) {
-          msg =
-            "저작권 제한으로 인해 이 영상은 다운로드할 수 없습니다.";
-        }
-
-        fastify.log.error({ stderr }, "yt-dlp failed");
-
-        if (fs.existsSync(tmpPath)) {
-          fs.unlink(tmpPath, () => {});
-        }
-
-        reply.code(500);
-        return resolve({ success: false, message: msg });
-      }
-
-      // 성공: 파일 사이즈 확인
-      const stat = fs.statSync(tmpPath);
-      if (stat.size === 0) {
-        fs.unlink(tmpPath, () => {});
-        reply.code(500);
-        return resolve({
-          success: false,
-          message: "결과 파일이 비어 있습니다.",
-        });
-      }
-
-      // 여기서부터 파일 스트리밍 응답
-      const filenameBase = "lee_downloader";
-      const filename = `${filenameBase}_${mode === "audio" ? "audio" : "video"}.${ext}`;
-
-      reply.header(
-        "Content-Type",
-        mode === "audio" ? "audio/mpeg" : "video/mp4"
-      );
-      reply.header(
-        "Content-Disposition",
-        `attachment; filename="${encodeURIComponent(filename)}"`
-      );
-
-      const stream = fs.createReadStream(tmpPath);
-
-      // 스트림이 끝나면 임시파일 삭제
-      stream.on("close", () => {
-        fs.unlink(tmpPath, () => {});
-      });
-
-      stream.pipe(reply.raw);
-
-      // fastify에서 직접 resolve 안 하면 응답이 끝날 때까지 기다림
-      resolve();
-    });
+  let stderr = '';
+  ytdlp.stderr.on('data', (chunk) => {
+    const text = chunk.toString();
+    stderr += text;
+    fastify.log.warn(text.trim());
   });
+
+  const exitCode = await new Promise((resolve) => {
+    ytdlp.on('close', resolve);
+  });
+
+  if (exitCode !== 0) {
+    fastify.log.error({ url, exitCode, stderr }, 'yt-dlp 실패');
+
+    try { fs.unlinkSync(tmpPath); } catch {}
+
+    // 유튜브 봇/로그인 차단 같은 경우를 사용자에게 안내
+    const isYoutubeBot =
+      stderr.includes('Sign in to confirm you\'re not a bot') ||
+      stderr.includes('100.0% of this video has been cut off') ||
+      stderr.toLowerCase().includes('login') ||
+      stderr.toLowerCase().includes('cookies');
+
+    const message = isYoutubeBot
+      ? '이 영상은 YouTube에서 로그인/인증이 필요해서 웹 버전에서 다운로드가 막힌 것 같아요. PC용 Lee Downloader 프로그램으로 시도해 보세요.'
+      : '서버에서 영상을 가져오는 중 오류가 발생했습니다. 잠시 후 다시 시도해 보거나 다른 영상을 사용해 보세요.';
+
+    return reply
+      .code(500)
+      .type('application/json')
+      .send({
+        success: false,
+        message,
+        detail: stderr.slice(0, 4000),
+      });
+  }
+
+  // 성공한 경우에만 파일 전송
+  let stat;
+  try {
+    stat = fs.statSync(tmpPath);
+  } catch {
+    return reply
+      .code(500)
+      .type('application/json')
+      .send({
+        success: false,
+        message: '다운로드는 완료됐지만 임시 파일을 찾을 수 없습니다.',
+      });
+  }
+
+  const filename =
+    (mode === 'audio' ? 'lee_downloader_' : 'lee_downloader_video_') +
+    Date.now() +
+    (mode === 'audio' ? '.mp3' : '.mp4');
+
+  reply.header(
+    'Content-Type',
+    mode === 'audio' ? 'audio/mpeg' : 'video/mp4'
+  );
+  reply.header(
+    'Content-Disposition',
+    `attachment; filename="${filename}"`
+  );
+  reply.header('Content-Length', stat.size);
+
+  const stream = fs.createReadStream(tmpPath);
+  stream.on('close', () => {
+    fs.unlink(tmpPath, () => {});
+  });
+
+  return reply.send(stream);
 });
 
 // 서버 시작
-const start = async () => {
-  try {
-    await fastify.listen({ port: PORT, host: "0.0.0.0" });
-    console.log("==> Lee Downloader API listening on", PORT);
-  } catch (err) {
+const PORT = process.env.PORT || 10000;
+fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
+  if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
-};
-
-start();
+  fastify.log.info(`Lee Downloader API 서버가 ${address}에서 실행 중`);
+});

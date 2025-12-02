@@ -1,143 +1,185 @@
-// server.js - Lee Downloader Web API (yt-dlp 백엔드)
+// server.js - Lee Downloader Web API
+// Fastify + yt-dlp 스트리밍 + 로그인 필요 영상 사전 체크
 
-import Fastify from "fastify";
-import cors from "@fastify/cors";
-import { spawn } from "child_process";
-import fs from "fs";
-import path from "path";
+const fastify = require("fastify")({ logger: true });
+const cors = require("@fastify/cors");
+const { spawn } = require("child_process");
 
-const fastify = Fastify({ logger: true });
+const PORT = process.env.PORT || 3000;
 
-// CORS 허용 (프론트에서 바로 호출할 수 있게)
-await fastify.register(cors, { origin: "*" });
-
-// 유틸: yt-dlp stderr 모아서 문자열로
-function collectStderr(proc, logPrefix = "yt-dlp") {
-  let buf = "";
-  proc.stderr.on("data", (chunk) => {
-    const text = chunk.toString();
-    buf += text;
-    console.log(`${logPrefix}:`, text.trim());
-  });
-  return () => buf;
-}
-
-// 메인 API
-fastify.post("/api/download", async (request, reply) => {
-  try {
-    const body = request.body || {};
-    const url = body.url;
-    const resolution = body.resolution || "auto";
-    const mp3Only = !!body.mp3Only;
-
-    if (!url) {
-      reply.code(400);
-      return { ok: false, message: "URL이 없습니다." };
-    }
-
-    // 임시 파일 경로 (/tmp 아래에 랜덤 이름)
-    const ext = mp3Only ? "mp3" : "mp4";
-    const tmpName = `lee_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2)}.${ext}`;
-    const outPath = path.join("/tmp", tmpName);
-
-    // yt-dlp 옵션 구성
-    let format;
-    if (mp3Only) {
-      format = "bestaudio/best";
-    } else {
-      if (resolution === "auto") {
-        format = "bestvideo+bestaudio/best";
-      } else {
-        format = `bestvideo[height<=${resolution}]+bestaudio/best`;
-      }
-    }
-
-    const args = mp3Only
-      ? [
-          "-f",
-          format,
-          "-x",
-          "--audio-format",
-          "mp3",
-          "-o",
-          outPath,
-          url,
-        ]
-      : ["-f", format, "-o", outPath, url];
-
-    fastify.log.info({ msg: "yt-dlp 실행", url, args });
-
-    const proc = spawn("yt-dlp", args);
-    const getStderr = collectStderr(proc);
-
-    // 프로세스 종료 기다리기 (Promise 래핑)
-    const exitCode = await new Promise((resolve) => {
-      proc.on("close", (code) => resolve(code));
-    });
-
-    const stderr = getStderr();
-
-    // 실패 시: JSON 에러로 응답
-    if (exitCode !== 0) {
-      fastify.log.error({ msg: "yt-dlp 실패", exitCode, stderr });
-
-      // 로그인 필요/봇 의심 같은 메시지는 좀 더 친절하게 변환
-      let userMessage = "다운로드 중 오류가 발생했습니다.";
-      if (stderr.includes("Sign in to confirm you're not a bot")) {
-        userMessage =
-          "이 영상은 YouTube에서 사람 확인(로그인)이 필요해서 Web 버전에서는 다운로드할 수 없어요. PC용 Lee Downloader 프로그램으로 시도해 주세요.";
-      }
-
-      reply.code(500);
-      return {
-        ok: false,
-        message: userMessage,
-        stderr,
-      };
-    }
-
-    // 성공 시: 파일이 실제로 존재하는지 확인
-    let stat;
-    try {
-      stat = await fs.promises.stat(outPath);
-    } catch (e) {
-      fastify.log.error({ msg: "임시 파일 없음", outPath, e });
-      reply.code(500);
-      return {
-        ok: false,
-        message: "다운로드 파일을 찾을 수 없습니다.",
-      };
-    }
-
-    // 파일 스트림으로 전송 + 전송 후 임시 파일 삭제
-    reply.header(
-      "Content-Disposition",
-      `attachment; filename="lee_downloader.${ext}"`
-    );
-    reply.header("Content-Length", stat.size);
-    reply.type(mp3Only ? "audio/mpeg" : "video/mp4");
-
-    const stream = fs.createReadStream(outPath);
-    stream.on("close", () => {
-      fs.promises.unlink(outPath).catch(() => {});
-    });
-
-    return reply.send(stream);
-  } catch (err) {
-    fastify.log.error({ msg: "서버 예외", err });
-    reply.code(500);
-    return { ok: false, message: "서버 내부 오류", detail: err.toString() };
-  }
+// CORS 허용 (웹앱에서 Ajax 요청 허용)
+fastify.register(cors, {
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
 });
 
-// 포트 설정
-const PORT = process.env.PORT || 3000;
+// 헬스 체크용 루트
+fastify.get("/", async () => {
+  return { ok: true, name: "Lee Downloader API", version: "1.0.0" };
+});
+
+// yt-dlp를 한 번 실행해서 결과(status, stderr, stdout)를 받아오는 헬퍼
+function runYtDlp(args) {
+  return new Promise((resolve) => {
+    const proc = spawn("yt-dlp", args);
+    let stderr = "";
+    let stdout = "";
+
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      fastify.log.warn({ msg: "yt-dlp stderr", text });
+    });
+
+    proc.on("error", (err) => {
+      fastify.log.error(err);
+      resolve({ code: -1, stderr: String(err), stdout });
+    });
+
+    proc.on("close", (code) => {
+      resolve({ code, stderr, stdout });
+    });
+  });
+}
+
+// 메인 다운로드 엔드포인트
+fastify.post("/api/download", async (request, reply) => {
+  const body = request.body || {};
+  const url = (body.url || "").trim();
+  const downloadType = body.downloadType === "audio" ? "audio" : "video"; // 'video' | 'audio'
+  const quality = body.quality || "auto"; // 'auto' or '2160' '1080' ...
+
+  if (!url) {
+    reply.code(400);
+    return { success: false, message: "URL이 비어 있습니다." };
+  }
+
+  // 1단계: 사전 체크 (simulate) - 로그인/봇 차단/DRM 등으로 막히는지 확인
+  // 실패하면 아예 파일 스트림을 열지 않고 JSON 에러를 반환한다.
+  const checkArgs = [
+    "-s", // simulate: 다운로드는 안 하고 접근만 테스트
+    "--no-warnings",
+    "--quiet",
+    url,
+  ];
+
+  const checkResult = await runYtDlp(checkArgs);
+
+  if (checkResult.code !== 0) {
+    const snippet = (checkResult.stderr || "").slice(0, 400);
+    fastify.log.error({
+      msg: "yt-dlp pre-check failed",
+      code: checkResult.code,
+      stderr: snippet,
+    });
+
+    reply.code(400);
+    return {
+      success: false,
+      message:
+        "이 영상은 유튜브에서 로그인 또는 추가 인증이 필요해서 웹 버전에서는 다운로드할 수 없어요.\nPC용 Lee Downloader(윈도우 프로그램)으로 시도해 주세요.",
+      detail: snippet,
+    };
+  }
+
+  // 2단계: 실제 다운로드 스트리밍
+  const args = ["--no-progress", "--quiet", "--no-warnings"];
+
+  if (downloadType === "audio") {
+    // 최고 음질 mp3
+    args.push("-f", "bestaudio/best");
+    args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
+  } else {
+    // 영상
+    if (quality === "auto") {
+      args.push("-f", "bv*+ba/b");
+    } else {
+      const h = parseInt(quality, 10);
+      if (!Number.isNaN(h)) {
+        args.push("-f", `bestvideo[height<=${h}]+bestaudio/best`);
+      } else {
+        args.push("-f", "bv*+ba/b");
+      }
+    }
+  }
+
+  // 표준 출력으로 보내기
+  args.push("-o", "-");
+  args.push(url);
+
+  const filenameBase =
+    downloadType === "audio" ? "lee_downloader_audio" : "lee_downloader_video";
+  const ext = downloadType === "audio" ? "mp3" : "mp4";
+
+  reply.header(
+    "Content-Type",
+    downloadType === "audio" ? "audio/mpeg" : "video/mp4"
+  );
+  reply.header(
+    "Content-Disposition",
+    `attachment; filename="${filenameBase}.${ext}"`
+  );
+
+  // 스트리밍
+  return await new Promise((resolve) => {
+    const proc = spawn("yt-dlp", args);
+
+    proc.stdout.on("data", (chunk) => {
+      reply.raw.write(chunk);
+    });
+
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      fastify.log.warn({ msg: "yt-dlp stderr(download)", text });
+    });
+
+    proc.on("error", (err) => {
+      fastify.log.error(err);
+      // 이미 헤더가 나갔으면 바디만 종료
+      if (!reply.raw.headersSent) {
+        reply
+          .code(500)
+          .send({
+            success: false,
+            message: "다운로드 중 내부 오류가 발생했습니다.",
+            detail: String(err),
+          });
+      } else {
+        reply.raw.end();
+      }
+      resolve();
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        fastify.log.info("yt-dlp download finished successfully");
+        reply.raw.end();
+      } else {
+        fastify.log.error({
+          msg: "yt-dlp download exit non-zero",
+          code,
+          stderr: stderr.slice(0, 400),
+        });
+        // 이 경우 브라우저에서는 손상된 파일로 보일 수 있지만,
+        // 사전 체크에선 이미 통과했기 때문에 빈 파일은 거의 나오지 않는다.
+        reply.raw.end();
+      }
+      resolve();
+    });
+  });
+});
+
+// 서버 시작
 fastify.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
-  fastify.log.info(`Lee Downloader API Running on ${address}`);
+  fastify.log.info(`Lee Downloader API listening on ${address}`);
 });
